@@ -1,0 +1,8 @@
+{
+  "name": "M5 Local MoE Studio",
+  "description": "Local Mixture-of-Experts AI workspace for Apple Silicon M5 (16GB) with dedicated Hugging Face and local models for chat, image-to-prompt, text-to-image, image-to-image, and image-to-video over local LAN.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
