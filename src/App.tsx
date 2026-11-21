@@ -1,10 +1,13 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ChainPipelineModal } from "./components/ChainPipelineModal";
 import { ChatPromptWorkspace } from "./components/ChatPromptWorkspace";
 import { HeaderBar } from "./components/HeaderBar";
 import { ImageToImageWorkspace } from "./components/ImageToImageWorkspace";
 import { ImageToVideoWorkspace } from "./components/ImageToVideoWorkspace";
 import { LanAccessModal } from "./components/LanAccessModal";
+import { LanPinGate } from "./components/LanPinGate";
 import { ModelPickerModal } from "./components/ModelPickerModal";
+import { RenderQueuePanel } from "./components/RenderQueuePanel";
 import { SidebarExperts } from "./components/SidebarExperts";
 import { StorageFolderModal } from "./components/StorageFolderModal";
 import { TextToImageWorkspace } from "./components/TextToImageWorkspace";
@@ -15,22 +18,24 @@ import {
 } from "./data/moeDefaults";
 import {
   AssignedModel,
+  ChainPipelineMode,
   ChatMessage,
   ExecutionMode,
   ExpertConfigMap,
   ExpertFeatureId,
   GeneratedMediaItem,
+  LanAuthStatus,
+  RenderJob,
   RunnerEndpoints,
+  SavedDiskFile,
+  SavedOutputMetadata,
   StorageConfig,
+  SyncedWorkspaceState,
   SystemInfoResponse,
 } from "./types/moe";
+import { apiFetch, setLanSessionToken, withLanTokenUrl } from "./utils/apiClient";
 
-const STORAGE_KEYS = {
-  experts: "m5_moe_experts_v1",
-  endpoints: "m5_moe_endpoints_v1",
-  darkMode: "m5_moe_dark_v1",
-  swapStrategy: "m5_moe_swap_v1",
-};
+const DARK_MODE_KEY = "m5_moe_dark_v1";
 
 const FEATURES: ExpertFeatureId[] = [
   "chat",
@@ -39,38 +44,18 @@ const FEATURES: ExpertFeatureId[] = [
   "image-to-video",
 ];
 
-function loadSavedJson<T>(key: string, fallback: T): T {
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return fallback;
-    return { ...fallback, ...JSON.parse(raw) };
-  } catch {
-    return fallback;
-  }
-}
-
 export default function App() {
+  const [authStatus, setAuthStatus] = useState<LanAuthStatus | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+
   const [activeFeature, setActiveFeature] = useState<ExpertFeatureId>("chat");
-  const [experts, setExperts] = useState<ExpertConfigMap>(() =>
-    loadSavedJson<ExpertConfigMap>(STORAGE_KEYS.experts, DEFAULT_EXPERTS)
-  );
-  const [endpoints, setEndpoints] = useState<RunnerEndpoints>(() =>
-    loadSavedJson<RunnerEndpoints>(STORAGE_KEYS.endpoints, DEFAULT_ENDPOINTS)
-  );
-  const [swapStrategy, setSwapStrategy] = useState<"auto-swap" | "resident">(
-    () => {
-      try {
-        const val = localStorage.getItem(STORAGE_KEYS.swapStrategy);
-        return val === "resident" ? "resident" : "auto-swap";
-      } catch {
-        return "auto-swap";
-      }
-    }
-  );
+  const [experts, setExperts] = useState<ExpertConfigMap>(DEFAULT_EXPERTS);
+  const [endpoints, setEndpoints] = useState<RunnerEndpoints>(DEFAULT_ENDPOINTS);
+  const [swapStrategy, setSwapStrategy] = useState<"auto-swap" | "resident">("auto-swap");
   const [executionMode, setExecutionMode] = useState<ExecutionMode>("local");
   const [darkMode, setDarkMode] = useState<boolean>(() => {
     try {
-      return localStorage.getItem(STORAGE_KEYS.darkMode) === "true";
+      return localStorage.getItem(DARK_MODE_KEY) === "true";
     } catch {
       return false;
     }
@@ -78,36 +63,91 @@ export default function App() {
 
   const [systemInfo, setSystemInfo] = useState<SystemInfoResponse | null>(null);
   const [isRefreshingSystem, setIsRefreshingSystem] = useState(false);
+  const [isUnloadingWorker, setIsUnloadingWorker] = useState(false);
   const [storageConfig, setStorageConfig] = useState<StorageConfig | null>(null);
 
   const [pickerFeature, setPickerFeature] = useState<ExpertFeatureId | null>(null);
   const [lanModalOpen, setLanModalOpen] = useState(false);
   const [storageModalOpen, setStorageModalOpen] = useState(false);
+  const [chainModalOpen, setChainModalOpen] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
-  // Feature states & cross-feature handoff payloads
+  // Synced feature states & cross-feature handoff payloads
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [pendingChatImage, setPendingChatImage] = useState<string | null>(null);
 
   const [t2iHistory, setT2iHistory] = useState<GeneratedMediaItem[]>([]);
   const [t2iInitialPrompt, setT2iInitialPrompt] = useState("");
+  const [t2iRemix, setT2iRemix] = useState<SavedOutputMetadata | null>(null);
 
   const [i2iHistory, setI2iHistory] = useState<GeneratedMediaItem[]>([]);
   const [i2iInitialImage, setI2iInitialImage] = useState<string | null>(null);
   const [i2iInitialPrompt, setI2iInitialPrompt] = useState("");
+  const [i2iRemix, setI2iRemix] = useState<SavedOutputMetadata | null>(null);
 
   const [i2vHistory, setI2vHistory] = useState<GeneratedMediaItem[]>([]);
   const [i2vInitialImage, setI2vInitialImage] = useState<string | null>(null);
   const [i2vInitialPrompt, setI2vInitialPrompt] = useState("");
+  const [i2vRemix, setI2vRemix] = useState<SavedOutputMetadata | null>(null);
+
+  // FIFO render queue jobs
+  const [queueJobs, setQueueJobs] = useState<RenderJob[]>([]);
+  const lastStateSyncRef = useRef<string>("");
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", darkMode);
     try {
-      localStorage.setItem(STORAGE_KEYS.darkMode, String(darkMode));
+      localStorage.setItem(DARK_MODE_KEY, String(darkMode));
     } catch {
       // ignore
     }
   }, [darkMode]);
+
+  const applySyncedState = useCallback((state: Partial<SyncedWorkspaceState>) => {
+    if (state.updatedAt && state.updatedAt === lastStateSyncRef.current) return;
+    if (state.updatedAt) lastStateSyncRef.current = state.updatedAt;
+    if (state.experts) setExperts({ ...DEFAULT_EXPERTS, ...state.experts });
+    if (state.endpoints) setEndpoints({ ...DEFAULT_ENDPOINTS, ...state.endpoints });
+    if (state.swapStrategy) setSwapStrategy(state.swapStrategy);
+    if (state.executionMode) setExecutionMode(state.executionMode);
+    if (Array.isArray(state.chatMessages)) setChatMessages(state.chatMessages);
+    if (Array.isArray(state.t2iHistory)) setT2iHistory(state.t2iHistory);
+    if (Array.isArray(state.i2iHistory)) setI2iHistory(state.i2iHistory);
+    if (Array.isArray(state.i2vHistory)) setI2vHistory(state.i2vHistory);
+  }, []);
+
+  const persistHostState = useCallback(async (patch: Partial<SyncedWorkspaceState>) => {
+    try {
+      const res = await apiFetch("/api/state", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      if (res.ok) {
+        const saved = (await res.json()) as SyncedWorkspaceState;
+        if (saved.updatedAt) lastStateSyncRef.current = saved.updatedAt;
+      }
+    } catch {
+      // ignore transient network error
+    }
+  }, []);
+
+  const checkAuthStatus = useCallback(async () => {
+    try {
+      const res = await apiFetch("/api/auth/status");
+      if (res.ok) {
+        setAuthStatus((await res.json()) as LanAuthStatus);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setAuthReady(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    void checkAuthStatus();
+  }, [checkAuthStatus]);
 
   const fetchSystemInfo = useCallback(async () => {
     setIsRefreshingSystem(true);
@@ -119,10 +159,9 @@ export default function App() {
         a1111Url: endpoints.a1111Url,
         comfyuiUrl: endpoints.comfyuiUrl,
       });
-      const res = await fetch(`/api/system/info?${params.toString()}`);
+      const res = await apiFetch(`/api/system/info?${params.toString()}`);
       if (res.ok) {
-        const data = (await res.json()) as SystemInfoResponse;
-        setSystemInfo(data);
+        setSystemInfo((await res.json()) as SystemInfoResponse);
       }
     } catch {
       // ignore transient network failures
@@ -133,49 +172,237 @@ export default function App() {
 
   const fetchStorageConfig = useCallback(async () => {
     try {
-      const res = await fetch("/api/storage/config");
+      const res = await apiFetch("/api/storage/config");
       if (res.ok) {
         setStorageConfig((await res.json()) as StorageConfig);
       }
     } catch {
-      // ignore transient errors
+      // ignore
     }
   }, []);
 
+  const fetchHostState = useCallback(async () => {
+    try {
+      const res = await apiFetch("/api/state");
+      if (res.ok) {
+        const data = (await res.json()) as Partial<SyncedWorkspaceState>;
+        applySyncedState(data);
+      }
+    } catch {
+      // ignore
+    }
+  }, [applySyncedState]);
+
+  const fetchQueue = useCallback(async () => {
+    try {
+      const res = await apiFetch("/api/queue");
+      if (res.ok) {
+        const data = (await res.json()) as { jobs?: RenderJob[] };
+        setQueueJobs(data.jobs || []);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // Load synced state, system health, storage, and subscribe to live SSE hub once authenticated
   useEffect(() => {
+    if (!authReady || authStatus?.requiresPin) return;
+
+    void fetchHostState();
     void fetchSystemInfo();
     void fetchStorageConfig();
-  }, [fetchSystemInfo, fetchStorageConfig]);
+    void fetchQueue();
+
+    const es = new EventSource(withLanTokenUrl("/api/events"));
+    es.addEventListener("queue:update", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data) as { jobs?: RenderJob[] };
+        if (Array.isArray(data.jobs)) {
+          setQueueJobs(data.jobs);
+          // Refresh storage stats whenever a job completes
+          if (data.jobs.some((j) => j.status === "completed")) {
+            void fetchStorageConfig();
+          }
+        }
+      } catch {
+        // ignore
+      }
+    });
+    es.addEventListener("state:update", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data) as Partial<SyncedWorkspaceState>;
+        applySyncedState(data);
+      } catch {
+        // ignore
+      }
+    });
+
+    return () => {
+      es.close();
+    };
+  }, [
+    authReady,
+    authStatus?.requiresPin,
+    fetchHostState,
+    fetchSystemInfo,
+    fetchStorageConfig,
+    fetchQueue,
+    applySyncedState,
+  ]);
 
   function handleAssignModel(feature: ExpertFeatureId, model: AssignedModel) {
     setExperts((prev) => {
       const next = { ...prev, [feature]: model };
-      try {
-        localStorage.setItem(STORAGE_KEYS.experts, JSON.stringify(next));
-      } catch {
-        // ignore
-      }
+      void persistHostState({ experts: next });
       return next;
     });
   }
 
   function handleSaveEndpoints(nextEndpoints: RunnerEndpoints) {
     setEndpoints(nextEndpoints);
-    try {
-      localStorage.setItem(STORAGE_KEYS.endpoints, JSON.stringify(nextEndpoints));
-    } catch {
-      // ignore
-    }
+    void persistHostState({ endpoints: nextEndpoints });
   }
 
   function handleChangeSwapStrategy(strategy: "auto-swap" | "resident") {
     setSwapStrategy(strategy);
+    void persistHostState({ swapStrategy: strategy });
+  }
+
+  function handleChangeExecutionMode(mode: ExecutionMode) {
+    setExecutionMode(mode);
+    void persistHostState({ executionMode: mode });
+  }
+
+  function handleAppendChatMessage(msg: ChatMessage) {
+    setChatMessages((prev) => {
+      const next = [...prev, msg].slice(-60);
+      void persistHostState({ chatMessages: next });
+      return next;
+    });
+  }
+
+  function handleClearChatMessages() {
+    setChatMessages([]);
+    void persistHostState({ chatMessages: [] });
+  }
+
+  async function handleUnloadWorker() {
+    setIsUnloadingWorker(true);
     try {
-      localStorage.setItem(STORAGE_KEYS.swapStrategy, strategy);
+      await apiFetch("/api/worker/unload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mlxWorkerUrl: endpoints.mlxWorkerUrl }),
+      });
+      await fetchSystemInfo();
     } catch {
       // ignore
+    } finally {
+      setIsUnloadingWorker(false);
     }
   }
+
+  async function enqueueRenderJob(
+    type: RenderJob["type"],
+    label: string,
+    payload: Record<string, unknown>
+  ) {
+    const res = await apiFetch("/api/queue/enqueue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type, label, payload }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || "Could not enqueue render job");
+    }
+    if (data.queue?.jobs) {
+      setQueueJobs(data.queue.jobs);
+    }
+  }
+
+  async function handleCancelJob(jobId: string) {
+    const res = await apiFetch(`/api/queue/${encodeURIComponent(jobId)}/cancel`, {
+      method: "POST",
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.jobs) setQueueJobs(data.jobs);
+    }
+  }
+
+  async function handleClearCompletedJobs() {
+    const res = await apiFetch("/api/queue/clear-completed", { method: "POST" });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.jobs) setQueueJobs(data.jobs);
+    }
+  }
+
+  async function handleEnqueueChain(params: {
+    mode: ChainPipelineMode;
+    prompt: string;
+    sourceImageDataUrl?: string;
+    numFrames: number;
+    fps: number;
+    steps: number;
+    strength: number;
+  }) {
+    const labelMap: Record<ChainPipelineMode, string> = {
+      "prompt-to-image-to-video": "Chain: Prompt → T2I → I2V",
+      "image-to-prompt-to-video": "Chain: Image → Prompt → I2V",
+      "image-to-prompt-to-i2i-video": "Chain: Image → Prompt → I2I → I2V",
+    };
+    await enqueueRenderJob("chain-pipeline", labelMap[params.mode], {
+      ...params,
+      experts,
+      endpoints,
+      chatExecutionMode: executionMode,
+    });
+    setActiveFeature("image-to-video");
+  }
+
+  function handleRemixFile(file: SavedDiskFile) {
+    if (!file.metadata) return;
+    const meta = file.metadata;
+    if (meta.feature === "text-to-image") {
+      setT2iRemix(meta);
+      setActiveFeature("text-to-image");
+    } else if (meta.feature === "image-to-image") {
+      setI2iRemix(meta);
+      setI2iInitialImage(withLanTokenUrl(file.url));
+      setActiveFeature("image-to-image");
+    } else if (meta.feature === "image-to-video") {
+      setI2vRemix(meta);
+      setActiveFeature("image-to-video");
+    }
+  }
+
+  if (!authReady) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50 text-xs text-slate-500 dark:bg-slate-950 dark:text-slate-400">
+        Connecting to M5 MoE Studio...
+      </div>
+    );
+  }
+
+  if (authStatus?.requiresPin) {
+    return (
+      <LanPinGate
+        onUnlocked={(token) => {
+          setLanSessionToken(token);
+          setAuthStatus((prev) =>
+            prev ? { ...prev, authenticated: true, requiresPin: false } : prev
+          );
+        }}
+      />
+    );
+  }
+
+  const latestJobFor = (type: RenderJob["type"]) =>
+    queueJobs.find((j) => j.type === type && (j.status === "running" || j.status === "queued" || j.status === "failed")) ||
+    null;
 
   return (
     <div id="top" className="min-h-screen bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
@@ -210,10 +437,13 @@ export default function App() {
           onSelectFeature={setActiveFeature}
           experts={experts}
           onConfigureExpert={(feat) => setPickerFeature(feat)}
+          onOpenChainModal={() => setChainModalOpen(true)}
+          onUnloadWorker={() => void handleUnloadWorker()}
+          isUnloadingWorker={isUnloadingWorker}
           swapStrategy={swapStrategy}
           onChangeSwapStrategy={handleChangeSwapStrategy}
           executionMode={executionMode}
-          onChangeExecutionMode={setExecutionMode}
+          onChangeExecutionMode={handleChangeExecutionMode}
           systemInfo={systemInfo}
           onRefreshSystemInfo={() => void fetchSystemInfo()}
           isRefreshingSystem={isRefreshingSystem}
@@ -226,17 +456,23 @@ export default function App() {
         />
 
         <main className="min-w-0 flex-1">
+          <RenderQueuePanel
+            jobs={queueJobs}
+            onCancelJob={(id) => void handleCancelJob(id)}
+            onClearCompleted={() => void handleClearCompletedJobs()}
+          />
+
           {activeFeature === "chat" && (
             <ChatPromptWorkspace
               model={experts.chat}
               executionMode={executionMode}
               endpoints={endpoints}
               messages={chatMessages}
-              onAppendMessage={(msg) => setChatMessages((prev) => [...prev, msg])}
-              onClearMessages={() => setChatMessages([])}
+              onAppendMessage={handleAppendChatMessage}
+              onClearMessages={handleClearChatMessages}
               onOpenModelPicker={() => setPickerFeature("chat")}
               onOpenLanModal={() => setLanModalOpen(true)}
-              onSwitchExecutionMode={setExecutionMode}
+              onSwitchExecutionMode={handleChangeExecutionMode}
               onSendPromptToT2I={(prompt) => {
                 setT2iInitialPrompt(prompt);
                 setActiveFeature("text-to-image");
@@ -256,8 +492,16 @@ export default function App() {
               endpoints={endpoints}
               storageConfig={storageConfig}
               initialPrompt={t2iInitialPrompt}
+              remixSeed={t2iRemix}
+              activeQueueJob={latestJobFor("text-to-image")}
               history={t2iHistory}
-              onAddOutput={(item) => setT2iHistory((prev) => [item, ...prev])}
+              onEnqueueT2I={(payload) =>
+                enqueueRenderJob(
+                  "text-to-image",
+                  `T2I: ${payload.prompt.slice(0, 38)}`,
+                  payload
+                )
+              }
               onRefreshStorage={() => void fetchStorageConfig()}
               onOpenModelPicker={() => setPickerFeature("text-to-image")}
               onOpenLanModal={() => setLanModalOpen(true)}
@@ -282,8 +526,16 @@ export default function App() {
               storageConfig={storageConfig}
               initialImageUrl={i2iInitialImage}
               initialPrompt={i2iInitialPrompt}
+              remixSeed={i2iRemix}
+              activeQueueJob={latestJobFor("image-to-image")}
               history={i2iHistory}
-              onAddOutput={(item) => setI2iHistory((prev) => [item, ...prev])}
+              onEnqueueI2I={(payload) =>
+                enqueueRenderJob(
+                  "image-to-image",
+                  `I2I: ${payload.prompt.slice(0, 38)}`,
+                  payload
+                )
+              }
               onRefreshStorage={() => void fetchStorageConfig()}
               onOpenModelPicker={() => setPickerFeature("image-to-image")}
               onOpenLanModal={() => setLanModalOpen(true)}
@@ -307,8 +559,18 @@ export default function App() {
               storageConfig={storageConfig}
               initialImageUrl={i2vInitialImage}
               initialPrompt={i2vInitialPrompt}
+              remixSeed={i2vRemix}
+              activeQueueJob={
+                latestJobFor("image-to-video") || latestJobFor("chain-pipeline")
+              }
               history={i2vHistory}
-              onAddOutput={(item) => setI2vHistory((prev) => [item, ...prev])}
+              onEnqueueI2V={(payload) =>
+                enqueueRenderJob(
+                  "image-to-video",
+                  `I2V: ${payload.prompt.slice(0, 38)}`,
+                  payload
+                )
+              }
               onRefreshStorage={() => void fetchStorageConfig()}
               onOpenModelPicker={() => setPickerFeature("image-to-video")}
               onOpenLanModal={() => setLanModalOpen(true)}
@@ -333,6 +595,11 @@ export default function App() {
         endpoints={endpoints}
         onSaveEndpoints={handleSaveEndpoints}
         onRefreshSystemInfo={() => void fetchSystemInfo()}
+        authStatus={authStatus}
+        onUpdateAuthStatus={(nextStatus, token) => {
+          if (token !== undefined) setLanSessionToken(token);
+          setAuthStatus(nextStatus);
+        }}
       />
 
       <StorageFolderModal
@@ -348,6 +615,16 @@ export default function App() {
           setI2vInitialImage(imageUrl);
           setActiveFeature("image-to-video");
         }}
+        onRemixFile={handleRemixFile}
+      />
+
+      <ChainPipelineModal
+        open={chainModalOpen}
+        onClose={() => setChainModalOpen(false)}
+        experts={experts}
+        endpoints={endpoints}
+        executionMode={executionMode}
+        onEnqueueChain={handleEnqueueChain}
       />
     </div>
   );

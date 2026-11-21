@@ -7,6 +7,7 @@ import {
   RefreshCw,
   SlidersHorizontal,
   Sun,
+  Workflow,
   X,
   XCircle,
 } from "lucide-react";
@@ -24,6 +25,9 @@ interface SidebarExpertsProps {
   onSelectFeature: (feature: ExpertFeatureId) => void;
   experts: ExpertConfigMap;
   onConfigureExpert: (feature: ExpertFeatureId) => void;
+  onOpenChainModal: () => void;
+  onUnloadWorker: () => void;
+  isUnloadingWorker: boolean;
   swapStrategy: "auto-swap" | "resident";
   onChangeSwapStrategy: (strategy: "auto-swap" | "resident") => void;
   executionMode: ExecutionMode;
@@ -51,6 +55,9 @@ export function SidebarExperts({
   onSelectFeature,
   experts,
   onConfigureExpert,
+  onOpenChainModal,
+  onUnloadWorker,
+  isUnloadingWorker,
   swapStrategy,
   onChangeSwapStrategy,
   executionMode,

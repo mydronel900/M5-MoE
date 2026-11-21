@@ -11,9 +11,12 @@ import { useEffect, useState } from "react";
 import {
   AssignedModel,
   GeneratedMediaItem,
+  RenderJob,
   RunnerEndpoints,
+  SavedOutputMetadata,
   StorageConfig,
 } from "../types/moe";
+import { apiFetch, withLanTokenUrl } from "../utils/apiClient";
 import { formatDurationMs } from "../utils/imageHelpers";
 
 interface TextToImageWorkspaceProps {
@@ -21,8 +24,21 @@ interface TextToImageWorkspaceProps {
   endpoints: RunnerEndpoints;
   storageConfig: StorageConfig | null;
   initialPrompt: string;
+  remixSeed?: SavedOutputMetadata | null;
+  activeQueueJob?: RenderJob | null;
   history: GeneratedMediaItem[];
-  onAddOutput: (item: GeneratedMediaItem) => void;
+  onEnqueueT2I: (payload: {
+    model: string;
+    runner: string;
+    prompt: string;
+    negativePrompt: string;
+    width: number;
+    height: number;
+    steps: number;
+    guidanceScale: number;
+    seed?: number;
+    endpoints: RunnerEndpoints;
+  }) => Promise<void>;
   onRefreshStorage: () => void;
   onOpenModelPicker: () => void;
   onOpenLanModal: () => void;
@@ -44,8 +60,10 @@ export function TextToImageWorkspace({
   endpoints,
   storageConfig,
   initialPrompt,
+  remixSeed,
+  activeQueueJob,
   history,
-  onAddOutput,
+  onEnqueueT2I,
   onRefreshStorage,
   onOpenModelPicker,
   onOpenLanModal,
@@ -64,12 +82,9 @@ export function TextToImageWorkspace({
   const [steps, setSteps] = useState(4);
   const [guidanceScale, setGuidanceScale] = useState(3.5);
   const [seed, setSeed] = useState("");
-  const [isGenerating, setIsGenerating] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [manualSavedPath, setManualSavedPath] = useState<string | null>(null);
-  const [errorState, setErrorState] = useState<{
-    message: string;
-    isOffline?: boolean;
-  } | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   useEffect(() => {
     if (initialPrompt) {
@@ -77,65 +92,51 @@ export function TextToImageWorkspace({
     }
   }, [initialPrompt]);
 
+  useEffect(() => {
+    if (!remixSeed || remixSeed.feature !== "text-to-image") return;
+    if (remixSeed.prompt) setPrompt(remixSeed.prompt);
+    if (remixSeed.negativePrompt !== undefined) setNegativePrompt(remixSeed.negativePrompt);
+    if (remixSeed.steps) setSteps(remixSeed.steps);
+    if (remixSeed.guidanceScale !== undefined) setGuidanceScale(remixSeed.guidanceScale);
+    if (remixSeed.seed !== undefined) setSeed(String(remixSeed.seed));
+    if (remixSeed.width && remixSeed.height) {
+      const idx = ASPECT_PRESETS.findIndex(
+        (p) => p.width === remixSeed.width && p.height === remixSeed.height
+      );
+      if (idx >= 0) setAspectIdx(idx);
+    }
+  }, [remixSeed]);
+
   const latestItem = history[0] || null;
   const preset = ASPECT_PRESETS[aspectIdx];
+  const jobIsBusy =
+    activeQueueJob?.status === "running" || activeQueueJob?.status === "queued";
 
   async function handleGenerate(e: React.FormEvent) {
     e.preventDefault();
     if (!prompt.trim()) return;
-    setIsGenerating(true);
-    setErrorState(null);
+    setIsSubmitting(true);
+    setSubmitError(null);
+    setManualSavedPath(null);
 
     try {
       const parsedSeed = seed.trim() ? parseInt(seed.trim(), 10) : undefined;
-      const res = await fetch("/api/infer/text-to-image", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: model.id,
-          runner: model.runner,
-          prompt: prompt.trim(),
-          negativePrompt: negativePrompt.trim(),
-          width: preset.width,
-          height: preset.height,
-          steps,
-          guidanceScale,
-          seed: Number.isFinite(parsedSeed) ? parsedSeed : undefined,
-          endpoints,
-        }),
+      await onEnqueueT2I({
+        model: model.id,
+        runner: model.runner,
+        prompt: prompt.trim(),
+        negativePrompt: negativePrompt.trim(),
+        width: preset.width,
+        height: preset.height,
+        steps,
+        guidanceScale,
+        seed: Number.isFinite(parsedSeed) ? parsedSeed : undefined,
+        endpoints,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setErrorState({
-          message: data.error || "Text-to-Image generation failed",
-          isOffline: data.code === "LOCAL_RUNNER_OFFLINE",
-        });
-      } else {
-        setManualSavedPath(null);
-        onAddOutput({
-          id: `t2i-${Date.now()}`,
-          feature: "text-to-image",
-          prompt: prompt.trim(),
-          negativePrompt: negativePrompt.trim(),
-          outputUrl: data.outputUrl,
-          mimeType: data.mimeType || "image/png",
-          modelUsed: data.modelUsed || model.name,
-          runnerUsed: data.runnerUsed || model.runner,
-          width: preset.width,
-          height: preset.height,
-          seed: parsedSeed,
-          elapsedMs: data.elapsedMs || 0,
-          savedPath: data.savedPath,
-          savedFileName: data.savedFileName,
-          downloadUrl: data.downloadUrl,
-          createdAt: new Date().toISOString(),
-        });
-        onRefreshStorage();
-      }
-    } catch {
-      setErrorState({ message: "Network error calling Text-to-Image route." });
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "Failed to enqueue render job");
     } finally {
-      setIsGenerating(false);
+      setIsSubmitting(false);
     }
   }
 
@@ -273,19 +274,25 @@ export function TextToImageWorkspace({
 
           <button
             type="submit"
-            disabled={isGenerating || !prompt.trim()}
+            disabled={isSubmitting || !prompt.trim()}
             className="mt-auto w-full rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-blue-500 disabled:opacity-50"
           >
-            {isGenerating ? "Synthesizing on M5..." : "Generate Image Locally"}
+            {isSubmitting
+              ? "Queueing..."
+              : jobIsBusy
+              ? "Queue Another Render"
+              : "Queue Image Generation"}
           </button>
         </form>
 
         {/* Output Canvas & History */}
         <div className="flex flex-col gap-5">
-          {errorState && (
+          {(submitError || activeQueueJob?.status === "failed") && (
             <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
-              <p className="font-semibold">{errorState.message}</p>
-              {errorState.isOffline && (
+              <p className="font-semibold">
+                {submitError || activeQueueJob?.error}
+              </p>
+              {activeQueueJob?.isOffline && (
                 <div className="mt-3 flex flex-wrap items-center gap-2">
                   <button
                     type="button"
@@ -309,11 +316,39 @@ export function TextToImageWorkspace({
           )}
 
           <div className="flex min-h-[380px] flex-1 flex-col items-center justify-center rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
-            {latestItem ? (
+            {jobIsBusy && activeQueueJob ? (
+              <div className="w-full max-w-xl space-y-4 text-center">
+                {activeQueueJob.previewUrl && (
+                  <div className="overflow-hidden rounded-lg border border-slate-200 bg-slate-100 dark:border-slate-800 dark:bg-slate-950">
+                    <img
+                      src={activeQueueJob.previewUrl}
+                      alt="Progressive diffusion preview"
+                      className="mx-auto max-h-[420px] w-auto object-contain"
+                    />
+                  </div>
+                )}
+                <div className="space-y-2">
+                  <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">
+                    {activeQueueJob.status === "queued"
+                      ? `Queued at position #${activeQueueJob.position}`
+                      : activeQueueJob.stepLabel}
+                  </p>
+                  <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                    <div
+                      className="h-full bg-blue-600 transition-all duration-200"
+                      style={{ width: `${Math.max(4, activeQueueJob.progressPercent)}%` }}
+                    />
+                  </div>
+                  <p className="font-mono text-xs text-slate-500 tabular-nums dark:text-slate-400">
+                    {activeQueueJob.progressPercent}% · VAE tiling active
+                  </p>
+                </div>
+              </div>
+            ) : latestItem ? (
               <div className="w-full space-y-4">
                 <div className="overflow-hidden rounded-lg border border-slate-200 bg-slate-100 dark:border-slate-800 dark:bg-slate-950">
                   <img
-                    src={latestItem.outputUrl}
+                    src={withLanTokenUrl(latestItem.outputUrl)}
                     alt={latestItem.prompt}
                     referrerPolicy="no-referrer"
                     className="mx-auto max-h-[520px] w-auto object-contain"
@@ -324,7 +359,7 @@ export function TextToImageWorkspace({
                     <p className="text-xs text-slate-500 tabular-nums dark:text-slate-400">
                       {latestItem.modelUsed}
                       <span aria-hidden="true"> · </span>
-                      {latestItem.width}×{latestItem.height}
+                      {latestItem.width || preset.width}×{latestItem.height || preset.height}
                       <span aria-hidden="true"> · </span>
                       {formatDurationMs(latestItem.elapsedMs)}
                     </p>
@@ -338,12 +373,26 @@ export function TextToImageWorkspace({
                     <button
                       type="button"
                       onClick={async () => {
-                        const res = await fetch("/api/outputs/save", {
+                        const res = await apiFetch("/api/outputs/save", {
                           method: "POST",
                           headers: { "Content-Type": "application/json" },
                           body: JSON.stringify({
                             dataUrl: latestItem.outputUrl,
                             feature: "text-to-image",
+                            metadata: {
+                              feature: "text-to-image",
+                              prompt: latestItem.prompt,
+                              negativePrompt: latestItem.negativePrompt,
+                              modelUsed: latestItem.modelUsed,
+                              runnerUsed: latestItem.runnerUsed,
+                              width: latestItem.width,
+                              height: latestItem.height,
+                              steps: latestItem.steps,
+                              guidanceScale: latestItem.guidanceScale,
+                              seed: latestItem.seed,
+                              elapsedMs: latestItem.elapsedMs,
+                              createdAt: latestItem.createdAt,
+                            },
                           }),
                         });
                         if (res.ok) {
@@ -358,7 +407,7 @@ export function TextToImageWorkspace({
                       <span>Save to Folder</span>
                     </button>
                     <a
-                      href={latestItem.downloadUrl || latestItem.outputUrl}
+                      href={withLanTokenUrl(latestItem.downloadUrl || latestItem.outputUrl)}
                       download={latestItem.savedFileName || `m5-t2i-${latestItem.id}.png`}
                       className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
                     >
@@ -367,7 +416,7 @@ export function TextToImageWorkspace({
                     </a>
                     <button
                       type="button"
-                      onClick={() => onSendToI2I(latestItem.outputUrl, latestItem.prompt)}
+                      onClick={() => onSendToI2I(withLanTokenUrl(latestItem.outputUrl), latestItem.prompt)}
                       className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
                     >
                       <span>Image to Image</span>
@@ -375,7 +424,7 @@ export function TextToImageWorkspace({
                     </button>
                     <button
                       type="button"
-                      onClick={() => onSendToI2V(latestItem.outputUrl, latestItem.prompt)}
+                      onClick={() => onSendToI2V(withLanTokenUrl(latestItem.outputUrl), latestItem.prompt)}
                       className="inline-flex items-center gap-1 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-blue-500"
                     >
                       <span>Animate Video</span>
@@ -391,9 +440,8 @@ export function TextToImageWorkspace({
                   Local Text-to-Image Viewport
                 </p>
                 <p className="mt-1 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
-                  Generated images save to{" "}
-                  <span className="font-mono">{storageConfig?.outputDir || "~/M5-MoE-Outputs"}</span>{" "}
-                  and can be downloaded to any LAN device or passed into Image-to-Image and Image-to-Video.
+                  Jobs queue single-file for M5 16GB RAM with live step previews and save to{" "}
+                  <span className="font-mono">{storageConfig?.outputDir || "~/M5-MoE-Outputs"}</span>.
                 </p>
               </div>
             )}
@@ -405,11 +453,11 @@ export function TextToImageWorkspace({
                 <button
                   key={item.id}
                   type="button"
-                  onClick={() => onSendToI2I(item.outputUrl, item.prompt)}
+                  onClick={() => onSendToI2I(withLanTokenUrl(item.outputUrl), item.prompt)}
                   className="group overflow-hidden rounded-lg border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900"
                 >
                   <img
-                    src={item.outputUrl}
+                    src={withLanTokenUrl(item.outputUrl)}
                     alt={item.prompt}
                     referrerPolicy="no-referrer"
                     className="aspect-square w-full object-cover transition-transform duration-200 group-hover:scale-105"

@@ -13,9 +13,11 @@ import {
   ExpertFeatureId,
   HuggingFaceModelItem,
   LocalModelItem,
+  PullProgressEvent,
   RunnerBackend,
   RunnerEndpoints,
 } from "../types/moe";
+import { apiFetch } from "../utils/apiClient";
 import { formatDownloads } from "../utils/imageHelpers";
 
 interface ModelPickerModalProps {
@@ -60,6 +62,10 @@ export function ModelPickerModal({
   const [pullStatus, setPullStatus] = useState<{
     modelId: string;
     message: string;
+    percent?: number;
+    downloadedBytes?: number;
+    totalBytes?: number;
+    speedMbps?: number;
     command?: string;
     isError?: boolean;
   } | null>(null);
@@ -91,7 +97,7 @@ export function ModelPickerModal({
         feature: feat,
         limit: "16",
       });
-      const res = await fetch(`/api/hf/search?${params.toString()}`);
+      const res = await apiFetch(`/api/hf/search?${params.toString()}`);
       const data = await res.json();
       if (!res.ok) {
         setHfError(data.error || "Could not search Hugging Face Hub");
@@ -114,7 +120,7 @@ export function ModelPickerModal({
         mlxWorkerUrl: endpoints.mlxWorkerUrl,
         ollamaUrl: endpoints.ollamaUrl,
       });
-      const res = await fetch(`/api/local/models?${params.toString()}`);
+      const res = await apiFetch(`/api/local/models?${params.toString()}`);
       const data = await res.json();
       if (res.ok && Array.isArray(data.models)) {
         setLocalModels(data.models);
@@ -128,9 +134,13 @@ export function ModelPickerModal({
 
   async function handlePullModel(modelId: string) {
     setPullingId(modelId);
-    setPullStatus(null);
+    setPullStatus({
+      modelId,
+      message: `Starting download for ${modelId}...`,
+      percent: 0,
+    });
     try {
-      const res = await fetch("/api/models/pull", {
+      const res = await apiFetch("/api/models/pull/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -139,20 +149,62 @@ export function ModelPickerModal({
           endpoints,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
         setPullStatus({
           modelId,
           message: data.error || "Pull failed",
           command: data.command,
           isError: true,
         });
-      } else {
-        setPullStatus({
-          modelId,
-          message: `Downloaded ${modelId} to local M5 cache.`,
-        });
-        void fetchLocalModels();
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let idx = buffer.indexOf("\n\n");
+        while (idx !== -1) {
+          const chunk = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          for (const line of chunk.split("\n")) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("data:")) continue;
+            const raw = trimmed.slice(5).trim();
+            if (!raw) continue;
+            try {
+              const evt = JSON.parse(raw) as PullProgressEvent;
+              if (evt.status === "error" || evt.error) {
+                setPullStatus({
+                  modelId,
+                  message: evt.error || evt.message || "Download failed",
+                  command: evt.command,
+                  isError: true,
+                });
+              } else {
+                setPullStatus({
+                  modelId,
+                  message: evt.message || `Downloading ${modelId}...`,
+                  percent: evt.percent,
+                  downloadedBytes: evt.downloadedBytes,
+                  totalBytes: evt.totalBytes,
+                  speedMbps: evt.speedMbps,
+                });
+                if (evt.done || evt.status === "downloaded") {
+                  void fetchLocalModels();
+                }
+              }
+            } catch {
+              // ignore fragment
+            }
+          }
+          idx = buffer.indexOf("\n\n");
+        }
       }
     } catch {
       setPullStatus({

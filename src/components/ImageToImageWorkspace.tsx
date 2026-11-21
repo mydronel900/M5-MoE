@@ -12,9 +12,12 @@ import { STUDIO_SAMPLE_IMAGES } from "../data/moeDefaults";
 import {
   AssignedModel,
   GeneratedMediaItem,
+  RenderJob,
   RunnerEndpoints,
+  SavedOutputMetadata,
   StorageConfig,
 } from "../types/moe";
+import { apiFetch, withLanTokenUrl } from "../utils/apiClient";
 import { fileToDataUrl, formatDurationMs, urlToDataUrl } from "../utils/imageHelpers";
 
 interface ImageToImageWorkspaceProps {
@@ -23,8 +26,21 @@ interface ImageToImageWorkspaceProps {
   storageConfig: StorageConfig | null;
   initialImageUrl: string | null;
   initialPrompt: string;
+  remixSeed?: SavedOutputMetadata | null;
+  activeQueueJob?: RenderJob | null;
   history: GeneratedMediaItem[];
-  onAddOutput: (item: GeneratedMediaItem) => void;
+  onEnqueueI2I: (payload: {
+    model: string;
+    runner: string;
+    prompt: string;
+    negativePrompt: string;
+    imageDataUrl: string;
+    strength: number;
+    steps: number;
+    guidanceScale: number;
+    seed?: number;
+    endpoints: RunnerEndpoints;
+  }) => Promise<void>;
   onRefreshStorage: () => void;
   onOpenModelPicker: () => void;
   onOpenLanModal: () => void;
@@ -39,8 +55,10 @@ export function ImageToImageWorkspace({
   storageConfig,
   initialImageUrl,
   initialPrompt,
+  remixSeed,
+  activeQueueJob,
   history,
-  onAddOutput,
+  onEnqueueI2I,
   onRefreshStorage,
   onOpenModelPicker,
   onOpenLanModal,
@@ -61,12 +79,10 @@ export function ImageToImageWorkspace({
   const [strength, setStrength] = useState(0.55);
   const [steps, setSteps] = useState(12);
   const [guidanceScale, setGuidanceScale] = useState(7.0);
-  const [isGenerating, setIsGenerating] = useState(false);
+  const [seed, setSeed] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [manualSavedPath, setManualSavedPath] = useState<string | null>(null);
-  const [errorState, setErrorState] = useState<{
-    message: string;
-    isOffline?: boolean;
-  } | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -78,7 +94,19 @@ export function ImageToImageWorkspace({
     if (initialPrompt) setPrompt(initialPrompt);
   }, [initialPrompt]);
 
+  useEffect(() => {
+    if (!remixSeed || remixSeed.feature !== "image-to-image") return;
+    if (remixSeed.prompt) setPrompt(remixSeed.prompt);
+    if (remixSeed.negativePrompt !== undefined) setNegativePrompt(remixSeed.negativePrompt);
+    if (remixSeed.strength !== undefined) setStrength(remixSeed.strength);
+    if (remixSeed.steps) setSteps(remixSeed.steps);
+    if (remixSeed.guidanceScale !== undefined) setGuidanceScale(remixSeed.guidanceScale);
+    if (remixSeed.seed !== undefined) setSeed(String(remixSeed.seed));
+  }, [remixSeed]);
+
   const latestItem = history[0] || null;
+  const jobIsBusy =
+    activeQueueJob?.status === "running" || activeQueueJob?.status === "queued";
 
   async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -87,7 +115,7 @@ export function ImageToImageWorkspace({
       const dataUrl = await fileToDataUrl(file);
       setSourceImage(dataUrl);
     } catch {
-      setErrorState({ message: "Could not read uploaded image." });
+      setSubmitError("Could not read uploaded image.");
     }
     e.target.value = "";
   }
@@ -95,56 +123,29 @@ export function ImageToImageWorkspace({
   async function handleGenerate(e: React.FormEvent) {
     e.preventDefault();
     if (!sourceImage || !prompt.trim()) return;
-    setIsGenerating(true);
-    setErrorState(null);
+    setIsSubmitting(true);
+    setSubmitError(null);
+    setManualSavedPath(null);
 
     try {
       const imageDataUrl = await urlToDataUrl(sourceImage);
-      const res = await fetch("/api/infer/image-to-image", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: model.id,
-          runner: model.runner,
-          prompt: prompt.trim(),
-          negativePrompt: negativePrompt.trim(),
-          imageDataUrl,
-          strength,
-          steps,
-          guidanceScale,
-          endpoints,
-        }),
+      const parsedSeed = seed.trim() ? parseInt(seed.trim(), 10) : undefined;
+      await onEnqueueI2I({
+        model: model.id,
+        runner: model.runner,
+        prompt: prompt.trim(),
+        negativePrompt: negativePrompt.trim(),
+        imageDataUrl,
+        strength,
+        steps,
+        guidanceScale,
+        seed: Number.isFinite(parsedSeed) ? parsedSeed : undefined,
+        endpoints,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setErrorState({
-          message: data.error || "Image-to-Image failed",
-          isOffline: data.code === "LOCAL_RUNNER_OFFLINE",
-        });
-      } else {
-        setManualSavedPath(null);
-        onAddOutput({
-          id: `i2i-${Date.now()}`,
-          feature: "image-to-image",
-          prompt: prompt.trim(),
-          negativePrompt: negativePrompt.trim(),
-          outputUrl: data.outputUrl,
-          sourceImageUrl: imageDataUrl,
-          mimeType: data.mimeType || "image/png",
-          modelUsed: data.modelUsed || model.name,
-          runnerUsed: data.runnerUsed || model.runner,
-          elapsedMs: data.elapsedMs || 0,
-          savedPath: data.savedPath,
-          savedFileName: data.savedFileName,
-          downloadUrl: data.downloadUrl,
-          createdAt: new Date().toISOString(),
-        });
-        onRefreshStorage();
-      }
-    } catch {
-      setErrorState({ message: "Network error calling Image-to-Image route." });
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "Failed to queue Image-to-Image");
     } finally {
-      setIsGenerating(false);
+      setIsSubmitting(false);
     }
   }
 
@@ -277,7 +278,7 @@ export function ImageToImageWorkspace({
             />
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-3 gap-3">
             <label className="block">
               <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
                 Steps
@@ -293,7 +294,7 @@ export function ImageToImageWorkspace({
             </label>
             <label className="block">
               <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                Guidance CFG
+                CFG
               </span>
               <input
                 type="number"
@@ -305,23 +306,41 @@ export function ImageToImageWorkspace({
                 className="mt-1.5 w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 font-mono text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
               />
             </label>
+            <label className="block">
+              <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+                Seed
+              </span>
+              <input
+                type="text"
+                placeholder="Random"
+                value={seed}
+                onChange={(e) => setSeed(e.target.value)}
+                className="mt-1.5 w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 font-mono text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+              />
+            </label>
           </div>
 
           <button
             type="submit"
-            disabled={isGenerating || !prompt.trim()}
+            disabled={isSubmitting || !prompt.trim()}
             className="mt-auto w-full rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-blue-500 disabled:opacity-50"
           >
-            {isGenerating ? "Restyling on M5..." : "Run Image to Image"}
+            {isSubmitting
+              ? "Queueing..."
+              : jobIsBusy
+              ? "Queue Another Restyle"
+              : "Queue Image to Image"}
           </button>
         </form>
 
         {/* Comparison Viewport */}
         <div className="flex flex-col gap-5">
-          {errorState && (
+          {(submitError || activeQueueJob?.status === "failed") && (
             <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
-              <p className="font-semibold">{errorState.message}</p>
-              {errorState.isOffline && (
+              <p className="font-semibold">
+                {submitError || activeQueueJob?.error}
+              </p>
+              {activeQueueJob?.isOffline && (
                 <div className="mt-3 flex flex-wrap gap-2">
                   <button
                     type="button"
@@ -353,7 +372,7 @@ export function ImageToImageWorkspace({
               </div>
               <div className="flex flex-1 items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-950">
                 <img
-                  src={sourceImage}
+                  src={withLanTokenUrl(sourceImage)}
                   alt="Source input reference"
                   referrerPolicy="no-referrer"
                   className="max-h-[420px] w-full object-contain"
@@ -367,17 +386,38 @@ export function ImageToImageWorkspace({
                 <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
                   Transformed Output
                 </span>
-                {latestItem && (
+                {latestItem && !jobIsBusy && (
                   <span className="font-mono text-xs text-slate-500 tabular-nums dark:text-slate-400">
                     {formatDurationMs(latestItem.elapsedMs)}
                   </span>
                 )}
               </div>
 
-              <div className="flex flex-1 items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-950">
-                {latestItem ? (
+              <div className="flex flex-1 flex-col items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-950">
+                {jobIsBusy && activeQueueJob ? (
+                  <div className="w-full space-y-3 text-center">
+                    {activeQueueJob.previewUrl && (
+                      <img
+                        src={activeQueueJob.previewUrl}
+                        alt="Progressive step preview"
+                        className="mx-auto max-h-[340px] w-auto rounded object-contain"
+                      />
+                    )}
+                    <p className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                      {activeQueueJob.status === "queued"
+                        ? `Queued #${activeQueueJob.position}`
+                        : activeQueueJob.stepLabel}
+                    </p>
+                    <div className="mx-auto h-1.5 w-full max-w-xs overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+                      <div
+                        className="h-full bg-blue-600 transition-all duration-200"
+                        style={{ width: `${Math.max(4, activeQueueJob.progressPercent)}%` }}
+                      />
+                    </div>
+                  </div>
+                ) : latestItem ? (
                   <img
-                    src={latestItem.outputUrl}
+                    src={withLanTokenUrl(latestItem.outputUrl)}
                     alt={latestItem.prompt}
                     referrerPolicy="no-referrer"
                     className="max-h-[420px] w-full object-contain"
@@ -391,7 +431,7 @@ export function ImageToImageWorkspace({
                 )}
               </div>
 
-              {latestItem && (
+              {latestItem && !jobIsBusy && (
                 <div className="mt-3 space-y-2">
                   {(manualSavedPath || latestItem.savedPath) && (
                     <p className="truncate font-mono text-xs text-emerald-700 dark:text-emerald-400">
@@ -402,12 +442,25 @@ export function ImageToImageWorkspace({
                     <button
                       type="button"
                       onClick={async () => {
-                        const res = await fetch("/api/outputs/save", {
+                        const res = await apiFetch("/api/outputs/save", {
                           method: "POST",
                           headers: { "Content-Type": "application/json" },
                           body: JSON.stringify({
                             dataUrl: latestItem.outputUrl,
                             feature: "image-to-image",
+                            metadata: {
+                              feature: "image-to-image",
+                              prompt: latestItem.prompt,
+                              negativePrompt: latestItem.negativePrompt,
+                              modelUsed: latestItem.modelUsed,
+                              runnerUsed: latestItem.runnerUsed,
+                              steps: latestItem.steps,
+                              guidanceScale: latestItem.guidanceScale,
+                              strength: latestItem.strength,
+                              seed: latestItem.seed,
+                              elapsedMs: latestItem.elapsedMs,
+                              createdAt: latestItem.createdAt,
+                            },
                           }),
                         });
                         if (res.ok) {
@@ -422,7 +475,7 @@ export function ImageToImageWorkspace({
                       <span>Save to Folder</span>
                     </button>
                     <a
-                      href={latestItem.downloadUrl || latestItem.outputUrl}
+                      href={withLanTokenUrl(latestItem.downloadUrl || latestItem.outputUrl)}
                       download={latestItem.savedFileName || `m5-i2i-${latestItem.id}.png`}
                       className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
                     >
@@ -431,7 +484,7 @@ export function ImageToImageWorkspace({
                     </a>
                     <button
                       type="button"
-                      onClick={() => onSendToI2V(latestItem.outputUrl, latestItem.prompt)}
+                      onClick={() => onSendToI2V(withLanTokenUrl(latestItem.outputUrl), latestItem.prompt)}
                       className="inline-flex items-center gap-1 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-blue-500"
                     >
                       <span>Animate Video</span>

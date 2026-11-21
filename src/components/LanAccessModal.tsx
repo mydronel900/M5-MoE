@@ -1,7 +1,8 @@
-import { Check, Copy, Download, Laptop, Smartphone, Terminal, X } from "lucide-react";
+import { Check, Copy, Download, Laptop, Lock, Smartphone, Terminal, X } from "lucide-react";
 import QRCode from "qrcode";
 import { useEffect, useState } from "react";
-import { RunnerEndpoints, SystemInfoResponse } from "../types/moe";
+import { LanAuthStatus, RunnerEndpoints, SystemInfoResponse } from "../types/moe";
+import { apiFetch } from "../utils/apiClient";
 
 interface LanAccessModalProps {
   open: boolean;
@@ -10,6 +11,8 @@ interface LanAccessModalProps {
   endpoints: RunnerEndpoints;
   onSaveEndpoints: (endpoints: RunnerEndpoints) => void;
   onRefreshSystemInfo: () => void;
+  authStatus: LanAuthStatus | null;
+  onUpdateAuthStatus: (status: LanAuthStatus, token?: string) => void;
 }
 
 export function LanAccessModal({
@@ -19,12 +22,17 @@ export function LanAccessModal({
   endpoints,
   onSaveEndpoints,
   onRefreshSystemInfo,
+  authStatus,
+  onUpdateAuthStatus,
 }: LanAccessModalProps) {
   const [selectedUrl, setSelectedUrl] = useState("");
   const [qrSvg, setQrSvg] = useState("");
   const [copiedUrl, setCopiedUrl] = useState(false);
   const [copiedCmd, setCopiedCmd] = useState(false);
   const [draftEndpoints, setDraftEndpoints] = useState<RunnerEndpoints>(endpoints);
+  const [pinDraft, setPinDraft] = useState("");
+  const [pinSaving, setPinSaving] = useState(false);
+  const [pinNotice, setPinNotice] = useState<{ text: string; isError?: boolean } | null>(null);
 
   useEffect(() => {
     setDraftEndpoints(endpoints);
@@ -37,6 +45,7 @@ export function LanAccessModal({
       systemInfo?.mdnsUrl ||
       (typeof window !== "undefined" ? window.location.origin : "http://localhost:3000");
     setSelectedUrl(primary);
+    setPinNotice(null);
   }, [open, systemInfo]);
 
   useEffect(() => {
@@ -68,6 +77,49 @@ export function LanAccessModal({
       }
     } catch {
       // ignore clipboard restrictions
+    }
+  }
+
+  async function handleConfigurePin(enable: boolean) {
+    if (enable && !/^\d{4}$/.test(pinDraft)) {
+      setPinNotice({ text: "Enter a 4-digit numeric PIN.", isError: true });
+      return;
+    }
+    setPinSaving(true);
+    setPinNotice(null);
+    try {
+      const res = await apiFetch("/api/auth/configure-pin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabled: enable,
+          pin: enable ? pinDraft : undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setPinNotice({ text: data.error || "Failed to update PIN.", isError: true });
+      } else {
+        onUpdateAuthStatus(
+          {
+            lanPinEnabled: Boolean(data.lanPinEnabled),
+            authenticated: Boolean(data.authenticated),
+            isLocalhost: Boolean(data.isLocalhost),
+            requiresPin: Boolean(data.requiresPin),
+          },
+          data.token
+        );
+        setPinDraft("");
+        setPinNotice({
+          text: enable
+            ? "4-digit LAN Access PIN enabled for remote Wi-Fi devices."
+            : "LAN Access PIN disabled.",
+        });
+      }
+    } catch {
+      setPinNotice({ text: "Could not save LAN PIN setting.", isError: true });
+    } finally {
+      setPinSaving(false);
     }
   }
 

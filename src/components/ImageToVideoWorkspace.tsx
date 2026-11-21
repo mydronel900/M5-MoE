@@ -12,9 +12,12 @@ import { STUDIO_SAMPLE_IMAGES } from "../data/moeDefaults";
 import {
   AssignedModel,
   GeneratedMediaItem,
+  RenderJob,
   RunnerEndpoints,
+  SavedOutputMetadata,
   StorageConfig,
 } from "../types/moe";
+import { apiFetch, withLanTokenUrl } from "../utils/apiClient";
 import { fileToDataUrl, formatDurationMs, urlToDataUrl } from "../utils/imageHelpers";
 
 interface ImageToVideoWorkspaceProps {
@@ -23,8 +26,19 @@ interface ImageToVideoWorkspaceProps {
   storageConfig: StorageConfig | null;
   initialImageUrl: string | null;
   initialPrompt: string;
+  remixSeed?: SavedOutputMetadata | null;
+  activeQueueJob?: RenderJob | null;
   history: GeneratedMediaItem[];
-  onAddOutput: (item: GeneratedMediaItem) => void;
+  onEnqueueI2V: (payload: {
+    model: string;
+    runner: string;
+    prompt: string;
+    imageDataUrl: string;
+    numFrames: number;
+    fps: number;
+    seed?: number;
+    endpoints: RunnerEndpoints;
+  }) => Promise<void>;
   onRefreshStorage: () => void;
   onOpenModelPicker: () => void;
   onOpenLanModal: () => void;
@@ -37,8 +51,10 @@ export function ImageToVideoWorkspace({
   storageConfig,
   initialImageUrl,
   initialPrompt,
+  remixSeed,
+  activeQueueJob,
   history,
-  onAddOutput,
+  onEnqueueI2V,
   onRefreshStorage,
   onOpenModelPicker,
   onOpenLanModal,
@@ -54,12 +70,9 @@ export function ImageToVideoWorkspace({
   const [numFrames, setNumFrames] = useState(25);
   const [fps, setFps] = useState(12);
   const [seed, setSeed] = useState("");
-  const [isGenerating, setIsGenerating] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [manualSavedPath, setManualSavedPath] = useState<string | null>(null);
-  const [errorState, setErrorState] = useState<{
-    message: string;
-    isOffline?: boolean;
-  } | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -71,7 +84,17 @@ export function ImageToVideoWorkspace({
     if (initialPrompt) setPrompt(initialPrompt);
   }, [initialPrompt]);
 
+  useEffect(() => {
+    if (!remixSeed || remixSeed.feature !== "image-to-video") return;
+    if (remixSeed.prompt) setPrompt(remixSeed.prompt);
+    if (remixSeed.numFrames) setNumFrames(remixSeed.numFrames);
+    if (remixSeed.fps) setFps(remixSeed.fps);
+    if (remixSeed.seed !== undefined) setSeed(String(remixSeed.seed));
+  }, [remixSeed]);
+
   const latestItem = history[0] || null;
+  const jobIsBusy =
+    activeQueueJob?.status === "running" || activeQueueJob?.status === "queued";
 
   async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -80,7 +103,7 @@ export function ImageToVideoWorkspace({
       const dataUrl = await fileToDataUrl(file);
       setSourceImage(dataUrl);
     } catch {
-      setErrorState({ message: "Could not read keyframe image." });
+      setSubmitError("Could not read keyframe image.");
     }
     e.target.value = "";
   }
@@ -88,55 +111,27 @@ export function ImageToVideoWorkspace({
   async function handleGenerate(e: React.FormEvent) {
     e.preventDefault();
     if (!sourceImage || !prompt.trim()) return;
-    setIsGenerating(true);
-    setErrorState(null);
+    setIsSubmitting(true);
+    setSubmitError(null);
+    setManualSavedPath(null);
 
     try {
       const imageDataUrl = await urlToDataUrl(sourceImage);
       const parsedSeed = seed.trim() ? parseInt(seed.trim(), 10) : undefined;
-      const res = await fetch("/api/infer/image-to-video", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: model.id,
-          runner: model.runner,
-          prompt: prompt.trim(),
-          imageDataUrl,
-          numFrames,
-          fps,
-          seed: Number.isFinite(parsedSeed) ? parsedSeed : undefined,
-          endpoints,
-        }),
+      await onEnqueueI2V({
+        model: model.id,
+        runner: model.runner,
+        prompt: prompt.trim(),
+        imageDataUrl,
+        numFrames,
+        fps,
+        seed: Number.isFinite(parsedSeed) ? parsedSeed : undefined,
+        endpoints,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setErrorState({
-          message: data.error || "Image-to-Video failed",
-          isOffline: data.code === "LOCAL_RUNNER_OFFLINE",
-        });
-      } else {
-        setManualSavedPath(null);
-        onAddOutput({
-          id: `i2v-${Date.now()}`,
-          feature: "image-to-video",
-          prompt: prompt.trim(),
-          outputUrl: data.outputUrl,
-          sourceImageUrl: imageDataUrl,
-          mimeType: data.mimeType || "video/mp4",
-          modelUsed: data.modelUsed || model.name,
-          runnerUsed: data.runnerUsed || model.runner,
-          elapsedMs: data.elapsedMs || 0,
-          savedPath: data.savedPath,
-          savedFileName: data.savedFileName,
-          downloadUrl: data.downloadUrl,
-          createdAt: new Date().toISOString(),
-        });
-        onRefreshStorage();
-      }
-    } catch {
-      setErrorState({ message: "Network error calling Image-to-Video route." });
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "Failed to queue Image-to-Video");
     } finally {
-      setIsGenerating(false);
+      setIsSubmitting(false);
     }
   }
 
@@ -209,7 +204,7 @@ export function ImageToVideoWorkspace({
 
             <div className="mt-2 overflow-hidden rounded-lg border border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-950">
               <img
-                src={sourceImage}
+                src={withLanTokenUrl(sourceImage)}
                 alt="Starting video keyframe"
                 referrerPolicy="no-referrer"
                 className="h-36 w-full object-cover"
@@ -294,18 +289,24 @@ export function ImageToVideoWorkspace({
 
           <button
             type="submit"
-            disabled={isGenerating || !prompt.trim()}
+            disabled={isSubmitting || !prompt.trim()}
             className="mt-auto w-full rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-blue-500 disabled:opacity-50"
           >
-            {isGenerating ? "Rendering Video on M5..." : "Generate Video Locally"}
+            {isSubmitting
+              ? "Queueing..."
+              : jobIsBusy
+              ? "Queue Another Video"
+              : "Queue Video Generation"}
           </button>
         </form>
 
         <div className="flex flex-col gap-5">
-          {errorState && (
+          {(submitError || activeQueueJob?.status === "failed") && (
             <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
-              <p className="font-semibold">{errorState.message}</p>
-              {errorState.isOffline && (
+              <p className="font-semibold">
+                {submitError || activeQueueJob?.error}
+              </p>
+              {activeQueueJob?.isOffline && (
                 <div className="mt-3 flex flex-wrap gap-2">
                   <button
                     type="button"
@@ -321,10 +322,38 @@ export function ImageToVideoWorkspace({
           )}
 
           <div className="flex min-h-[380px] flex-1 flex-col items-center justify-center rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
-            {latestItem ? (
+            {jobIsBusy && activeQueueJob ? (
+              <div className="w-full max-w-xl space-y-4 text-center">
+                {activeQueueJob.previewUrl && (
+                  <div className="overflow-hidden rounded-lg border border-slate-200 bg-slate-100 dark:border-slate-800 dark:bg-slate-950">
+                    <img
+                      src={activeQueueJob.previewUrl}
+                      alt="Progressive video diffusion preview"
+                      className="mx-auto max-h-[380px] w-auto object-contain"
+                    />
+                  </div>
+                )}
+                <div className="space-y-2">
+                  <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">
+                    {activeQueueJob.status === "queued"
+                      ? `Queued at position #${activeQueueJob.position}`
+                      : activeQueueJob.stepLabel}
+                  </p>
+                  <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                    <div
+                      className="h-full bg-blue-600 transition-all duration-200"
+                      style={{ width: `${Math.max(4, activeQueueJob.progressPercent)}%` }}
+                    />
+                  </div>
+                  <p className="font-mono text-xs text-slate-500 tabular-nums dark:text-slate-400">
+                    {activeQueueJob.progressPercent}% · VAE tiling active
+                  </p>
+                </div>
+              </div>
+            ) : latestItem ? (
               <div className="w-full space-y-4">
                 <video
-                  src={latestItem.outputUrl}
+                  src={withLanTokenUrl(latestItem.outputUrl)}
                   controls
                   loop
                   autoPlay
@@ -336,7 +365,7 @@ export function ImageToVideoWorkspace({
                     <p className="text-xs text-slate-500 tabular-nums dark:text-slate-400">
                       {latestItem.modelUsed}
                       <span aria-hidden="true"> · </span>
-                      {numFrames} frames @ {fps} fps
+                      {latestItem.numFrames || numFrames} frames @ {latestItem.fps || fps} fps
                       <span aria-hidden="true"> · </span>
                       {formatDurationMs(latestItem.elapsedMs)}
                     </p>
@@ -350,12 +379,23 @@ export function ImageToVideoWorkspace({
                     <button
                       type="button"
                       onClick={async () => {
-                        const res = await fetch("/api/outputs/save", {
+                        const res = await apiFetch("/api/outputs/save", {
                           method: "POST",
                           headers: { "Content-Type": "application/json" },
                           body: JSON.stringify({
                             dataUrl: latestItem.outputUrl,
                             feature: "image-to-video",
+                            metadata: {
+                              feature: "image-to-video",
+                              prompt: latestItem.prompt,
+                              modelUsed: latestItem.modelUsed,
+                              runnerUsed: latestItem.runnerUsed,
+                              numFrames: latestItem.numFrames,
+                              fps: latestItem.fps,
+                              seed: latestItem.seed,
+                              elapsedMs: latestItem.elapsedMs,
+                              createdAt: latestItem.createdAt,
+                            },
                           }),
                         });
                         if (res.ok) {
@@ -370,7 +410,7 @@ export function ImageToVideoWorkspace({
                       <span>Save to Folder</span>
                     </button>
                     <a
-                      href={latestItem.downloadUrl || latestItem.outputUrl}
+                      href={withLanTokenUrl(latestItem.downloadUrl || latestItem.outputUrl)}
                       download={latestItem.savedFileName || `m5-i2v-${latestItem.id}.mp4`}
                       className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 dark:bg-blue-600 dark:hover:bg-blue-500"
                     >
@@ -387,9 +427,8 @@ export function ImageToVideoWorkspace({
                   Local Image-to-Video Viewport
                 </p>
                 <p className="mt-1 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
-                  Generated videos save to{" "}
-                  <span className="font-mono">{storageConfig?.outputDir || "~/M5-MoE-Outputs"}</span>{" "}
-                  on your M5 MacBook Air and can be downloaded from any device on your LAN.
+                  Jobs queue single-file for M5 16GB RAM with live previews and save to{" "}
+                  <span className="font-mono">{storageConfig?.outputDir || "~/M5-MoE-Outputs"}</span>.
                 </p>
               </div>
             )}

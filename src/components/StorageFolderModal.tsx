@@ -4,11 +4,13 @@ import {
   Download,
   FolderOpen,
   RefreshCw,
+  RotateCcw,
   Trash2,
   X,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { SavedDiskFile, StorageConfig } from "../types/moe";
+import { apiFetch, withLanTokenUrl } from "../utils/apiClient";
 
 interface StorageFolderModalProps {
   open: boolean;
@@ -17,6 +19,7 @@ interface StorageFolderModalProps {
   onUpdateStorageConfig: (config: StorageConfig) => void;
   onSendImageToI2I: (imageUrl: string) => void;
   onSendImageToI2V: (imageUrl: string) => void;
+  onRemixFile: (file: SavedDiskFile) => void;
 }
 
 const FOLDER_PRESETS = [
@@ -40,6 +43,7 @@ export function StorageFolderModal({
   onUpdateStorageConfig,
   onSendImageToI2I,
   onSendImageToI2V,
+  onRemixFile,
 }: StorageFolderModalProps) {
   const [draftDir, setDraftDir] = useState(storageConfig?.outputDir || "~/M5-MoE-Outputs");
   const [autoSave, setAutoSave] = useState(storageConfig?.autoSaveToDisk ?? true);
@@ -63,7 +67,7 @@ export function StorageFolderModal({
   async function fetchSavedFiles() {
     setLoadingFiles(true);
     try {
-      const res = await fetch("/api/outputs/list");
+      const res = await apiFetch("/api/outputs/list");
       if (res.ok) {
         const data = (await res.json()) as { files?: SavedDiskFile[] };
         setFiles(data.files || []);
@@ -80,7 +84,7 @@ export function StorageFolderModal({
     setSaving(true);
     setSaveMessage(null);
     try {
-      const res = await fetch("/api/storage/config", {
+      const res = await apiFetch("/api/storage/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -106,12 +110,12 @@ export function StorageFolderModal({
 
   async function handleDeleteFile(name: string) {
     try {
-      const res = await fetch(`/api/outputs/file?name=${encodeURIComponent(name)}`, {
+      const res = await apiFetch(`/api/outputs/file?name=${encodeURIComponent(name)}`, {
         method: "DELETE",
       });
       if (res.ok) {
         setFiles((prev) => prev.filter((f) => f.name !== name));
-        const cfgRes = await fetch("/api/storage/config");
+        const cfgRes = await apiFetch("/api/storage/config");
         if (cfgRes.ok) {
           onUpdateStorageConfig((await cfgRes.json()) as StorageConfig);
         }

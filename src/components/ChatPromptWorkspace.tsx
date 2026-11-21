@@ -17,6 +17,7 @@ import {
   ExecutionMode,
   RunnerEndpoints,
 } from "../types/moe";
+import { apiFetch, withLanTokenUrl } from "../utils/apiClient";
 import { fileToDataUrl, formatDurationMs, urlToDataUrl } from "../utils/imageHelpers";
 
 interface ChatPromptWorkspaceProps {
@@ -76,6 +77,7 @@ export function ChatPromptWorkspace({
     pendingImageForAnalysis
   );
   const [isSending, setIsSending] = useState(false);
+  const [streamingText, setStreamingText] = useState("");
   const [errorBanner, setErrorBanner] = useState<{
     message: string;
     isOffline?: boolean;
@@ -140,6 +142,7 @@ export function ChatPromptWorkspace({
     const currentImage = attachedImage;
     setAttachedImage(null);
     setIsSending(true);
+    setStreamingText("");
 
     try {
       const historyPayload = [...messages.slice(-8), userMsg].map((m) => ({
@@ -147,7 +150,7 @@ export function ChatPromptWorkspace({
         content: m.content,
       }));
 
-      const res = await fetch("/api/infer/chat", {
+      const res = await apiFetch("/api/infer/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -160,21 +163,82 @@ export function ChatPromptWorkspace({
           endpoints,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
         setErrorBanner({
-          message: data.error || "Inference failed",
+          message: data.error || "Inference stream failed",
           isOffline: data.code === "LOCAL_RUNNER_OFFLINE",
         });
-      } else {
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let accumulated = "";
+      let committed = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let idx = buffer.indexOf("\n\n");
+        while (idx !== -1) {
+          const chunk = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          for (const line of chunk.split("\n")) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("data:")) continue;
+            const raw = trimmed.slice(5).trim();
+            if (!raw) continue;
+            try {
+              const evt = JSON.parse(raw) as {
+                type?: string;
+                text?: string;
+                modelUsed?: string;
+                engineUsed?: string;
+                elapsedMs?: number;
+                error?: string;
+                code?: string;
+              };
+              if (evt.type === "delta" && evt.text) {
+                accumulated += evt.text;
+                setStreamingText(accumulated);
+              } else if (evt.type === "done") {
+                committed = true;
+                onAppendMessage({
+                  id: `a-${Date.now()}`,
+                  role: "assistant",
+                  content: evt.text || accumulated || "(Empty response)",
+                  mode: subMode,
+                  modelUsed: evt.modelUsed || model.name,
+                  engineUsed: evt.engineUsed || executionMode,
+                  elapsedMs: evt.elapsedMs,
+                  createdAt: new Date().toISOString(),
+                });
+              } else if (evt.type === "error") {
+                committed = true;
+                setErrorBanner({
+                  message: evt.error || "Inference failed",
+                  isOffline: evt.code === "LOCAL_RUNNER_OFFLINE",
+                });
+              }
+            } catch {
+              // ignore fragment
+            }
+          }
+          idx = buffer.indexOf("\n\n");
+        }
+      }
+
+      if (!committed && accumulated.trim()) {
         onAppendMessage({
           id: `a-${Date.now()}`,
           role: "assistant",
-          content: data.text || "(Empty response)",
+          content: accumulated.trim(),
           mode: subMode,
-          modelUsed: data.modelUsed || model.name,
-          engineUsed: data.engineUsed || executionMode,
-          elapsedMs: data.elapsedMs,
+          modelUsed: model.name,
+          engineUsed: executionMode,
           createdAt: new Date().toISOString(),
         });
       }
@@ -182,6 +246,7 @@ export function ChatPromptWorkspace({
       setErrorBanner({ message: "Network error reaching backend API." });
     } finally {
       setIsSending(false);
+      setStreamingText("");
     }
   }
 
@@ -325,7 +390,7 @@ export function ChatPromptWorkspace({
 
                 {msg.imageDataUrl && (
                   <img
-                    src={msg.imageDataUrl}
+                    src={withLanTokenUrl(msg.imageDataUrl)}
                     alt="Attached input for prompt extraction"
                     referrerPolicy="no-referrer"
                     className="mt-3 max-h-60 rounded-lg border border-slate-200 object-contain dark:border-slate-700"
@@ -375,8 +440,18 @@ export function ChatPromptWorkspace({
           )}
 
           {isSending && (
-            <div className="rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-500 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
-              Running {executionMode === "local" ? model.name : "Cloud Preview (Gemini 4 Hydrogen)"}...
+            <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+              <div className="flex items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
+                <span className="font-semibold text-slate-800 dark:text-slate-200">
+                  {executionMode === "local" ? model.name : "gemini-4-hydrogen (Cloud Preview)"}
+                </span>
+                <span className="text-blue-600 dark:text-blue-400">
+                  Streaming...
+                </span>
+              </div>
+              <div className="mt-2.5 whitespace-pre-wrap text-sm leading-relaxed text-slate-800 dark:text-slate-200">
+                {streamingText || "Connecting to inference stream..."}
+              </div>
             </div>
           )}
 
