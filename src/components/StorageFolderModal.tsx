@@ -308,14 +308,14 @@ export function StorageFolderModal({
                     <div className="aspect-video w-full overflow-hidden bg-slate-100 dark:bg-slate-900">
                       {file.isVideo ? (
                         <video
-                          src={file.url}
+                          src={withLanTokenUrl(file.url)}
                           controls
                           playsInline
                           className="h-full w-full object-contain bg-black"
                         />
                       ) : (
                         <img
-                          src={file.url}
+                          src={withLanTokenUrl(file.url)}
                           alt={file.name}
                           referrerPolicy="no-referrer"
                           className="h-full w-full object-cover"
@@ -335,7 +335,7 @@ export function StorageFolderModal({
 
                       <div className="mt-3 flex flex-wrap items-center gap-1.5">
                         <a
-                          href={file.downloadUrl}
+                          href={withLanTokenUrl(file.downloadUrl)}
                           download={file.name}
                           className="inline-flex flex-1 items-center justify-center gap-1 rounded-md bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 dark:bg-blue-600 dark:hover:bg-blue-500"
                         >
@@ -343,12 +343,27 @@ export function StorageFolderModal({
                           <span>Download</span>
                         </a>
 
+                        {file.metadata && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onRemixFile(file);
+                              onClose();
+                            }}
+                            title="Restore prompt, seed, steps & CFG from metadata"
+                            className="inline-flex items-center gap-1 rounded-md border border-slate-200 px-2 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                          >
+                            <RotateCcw className="h-3 w-3" />
+                            <span>Remix</span>
+                          </button>
+                        )}
+
                         {!file.isVideo && (
                           <>
                             <button
                               type="button"
                               onClick={() => {
-                                onSendImageToI2I(file.url);
+                                onSendImageToI2I(withLanTokenUrl(file.url));
                                 onClose();
                               }}
                               title="Send to Image-to-Image"
@@ -360,7 +375,7 @@ export function StorageFolderModal({
                             <button
                               type="button"
                               onClick={() => {
-                                onSendImageToI2V(file.url);
+                                onSendImageToI2V(withLanTokenUrl(file.url));
                                 onClose();
                               }}
                               title="Animate in Image-to-Video"

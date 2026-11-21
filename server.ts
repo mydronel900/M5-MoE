@@ -12,17 +12,33 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
-const HOST = "0.0.0.0";
+const HOST = process.env.HOST || "0.0.0.0";
+
+const DEFAULT_WORKER_HOST = process.env.M5_MLX_WORKER_HOST || "127.0.0.1";
+const DEFAULT_WORKER_PORT = Number(process.env.M5_MLX_WORKER_PORT || 8787);
+const DEFAULT_IDLE_TIMEOUT_SECONDS = Number(process.env.IDLE_UNLOAD_SECONDS || 300);
 
 const DEFAULT_ENDPOINTS = {
-  mlxWorkerUrl: process.env.M5_MLX_WORKER_URL || "http://127.0.0.1:8787",
+  mlxWorkerUrl:
+    process.env.M5_MLX_WORKER_URL || `http://${DEFAULT_WORKER_HOST}:${DEFAULT_WORKER_PORT}`,
   ollamaUrl: process.env.OLLAMA_URL || "http://127.0.0.1:11434",
   openaiLocalUrl: process.env.OPENAI_LOCAL_URL || "http://127.0.0.1:8080",
   a1111Url: process.env.A1111_URL || "http://127.0.0.1:7860",
   comfyuiUrl: process.env.COMFYUI_URL || "http://127.0.0.1:8188",
 };
 
-const DEFAULT_OUTPUT_DIR = path.join(os.homedir(), "M5-MoE-Outputs");
+function expandTildePath(rawPath: string): string {
+  const trimmed = rawPath.trim();
+  if (trimmed === "~") return os.homedir();
+  if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+    return path.resolve(os.homedir(), trimmed.slice(2));
+  }
+  return path.resolve(trimmed);
+}
+
+const DEFAULT_OUTPUT_DIR = process.env.M5_OUTPUT_DIR?.trim()
+  ? expandTildePath(process.env.M5_OUTPUT_DIR)
+  : path.join(os.homedir(), "M5-MoE-Outputs");
 const STUDIO_CONFIG_DIR = path.join(os.homedir(), ".m5-moe-studio");
 const STORAGE_CONFIG_FILE = path.join(STUDIO_CONFIG_DIR, "storage.json");
 const WORKSPACE_STATE_FILE = path.join(STUDIO_CONFIG_DIR, "workspace_state.json");
@@ -1043,12 +1059,14 @@ async function createServer() {
         { id: "a1111", label: "A1111 / Forge", url: a1111Url, online: a1111Probe.online, detail: a1111Probe.detail },
         { id: "comfyui", label: "ComfyUI", url: comfyuiUrl, online: comfyProbe.online, detail: comfyProbe.detail },
       ],
+      defaultEndpoints: DEFAULT_ENDPOINTS,
+      defaultOutputDir: DEFAULT_OUTPUT_DIR,
       workerHealth: mlxProbe.online
         ? {
             online: true,
             activeSlot: (mlxBody.activeSlot as string | null) ?? null,
             activeModel: (mlxBody.activeModel as string | null) ?? null,
-            idleTimeoutSeconds: Number(mlxBody.idleTimeoutSeconds ?? 300),
+            idleTimeoutSeconds: Number(mlxBody.idleTimeoutSeconds ?? DEFAULT_IDLE_TIMEOUT_SECONDS),
             idleSecondsRemaining:
               mlxBody.idleSecondsRemaining !== null && mlxBody.idleSecondsRemaining !== undefined
                 ? Number(mlxBody.idleSecondsRemaining)
@@ -1083,7 +1101,7 @@ async function createServer() {
 
   app.post("/api/worker/idle-config", async (req: Request, res: Response) => {
     const mlxWorkerUrl = String(req.body?.mlxWorkerUrl || DEFAULT_ENDPOINTS.mlxWorkerUrl);
-    const idleTimeoutSeconds = Number(req.body?.idleTimeoutSeconds ?? 300);
+    const idleTimeoutSeconds = Number(req.body?.idleTimeoutSeconds ?? DEFAULT_IDLE_TIMEOUT_SECONDS);
     try {
       const wRes = await fetch(`${mlxWorkerUrl.replace(/\/+$/, "")}/config/idle`, {
         method: "POST",
@@ -2128,7 +2146,7 @@ async function createServer() {
     const prompt = String(p.prompt || "");
     const negativePrompt = String(p.negativePrompt || "");
     const imageDataUrl = String(p.imageDataUrl || "");
-    const strength = Number(p.strength ?? 0.65);
+    const strength = Number(p.strength ?? 0.55);
     const steps = Number(p.steps || 12);
     const guidanceScale = Number(p.guidanceScale ?? 7.0);
     const seed = p.seed !== undefined && p.seed !== null ? Number(p.seed) : undefined;
@@ -2416,7 +2434,7 @@ async function createServer() {
               const t2iItem = await executeTextToImage(
                 nextJob,
                 {
-                  model: experts["text-to-image"]?.id || "black-forest-labs/FLUX.1-schnell",
+                  model: experts["text-to-image"]?.id || "filipstrand/FLUX.1-schnell-mflux-4bit",
                   runner: experts["text-to-image"]?.runner || "mlx-worker",
                   prompt: refinedPrompt,
                   width: Number(nextJob.payload.width || 1024),
@@ -2487,7 +2505,7 @@ async function createServer() {
             nextJob.status = "failed";
             nextJob.isOffline = looksOffline;
             nextJob.error = looksOffline
-              ? `Local M5 runner is offline. Start \`python3 m5_mlx_worker.py\` on your M5 MacBook Air to process queued jobs locally.`
+              ? `Local M5 runner is offline. Start \`python3 scripts/m5_mlx_worker.py\` on your M5 MacBook Air to process queued jobs locally.`
               : msg;
             nextJob.stepLabel = "Failed";
           }
@@ -2692,7 +2710,7 @@ async function createServer() {
     } catch {
       res.status(503).json({
         code: "LOCAL_RUNNER_OFFLINE",
-        error: `Local Text-to-Image runner (${runner}) is offline. Run \`python3 m5_mlx_worker.py\` on your M5 MacBook Air to process images locally on Apple Silicon.`,
+        error: `Local Text-to-Image runner (${runner}) is offline. Run \`python3 scripts/m5_mlx_worker.py\` on your M5 MacBook Air to process images locally on Apple Silicon.`,
       });
     }
   });
@@ -2811,7 +2829,7 @@ async function createServer() {
     } catch {
       res.status(503).json({
         code: "LOCAL_RUNNER_OFFLINE",
-        error: `Local Image-to-Image runner (${runner}) is offline. Run \`python3 m5_mlx_worker.py\` on your M5 MacBook Air to run local diffusion on MPS.`,
+        error: `Local Image-to-Image runner (${runner}) is offline. Run \`python3 scripts/m5_mlx_worker.py\` on your M5 MacBook Air to run local diffusion on MPS.`,
       });
     }
   });
@@ -2887,7 +2905,7 @@ async function createServer() {
     } catch {
       res.status(503).json({
         code: "LOCAL_RUNNER_OFFLINE",
-        error: `Local Image-to-Video runner (${runner}) is offline. Run \`python3 m5_mlx_worker.py\` on your M5 MacBook Air to animate images locally.`,
+        error: `Local Image-to-Video runner (${runner}) is offline. Run \`python3 scripts/m5_mlx_worker.py\` on your M5 MacBook Air to animate images locally.`,
       });
     }
   });

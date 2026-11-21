@@ -93,6 +93,7 @@ export default function App() {
   // FIFO render queue jobs
   const [queueJobs, setQueueJobs] = useState<RenderJob[]>([]);
   const lastStateSyncRef = useRef<string>("");
+  const hasPersistedEndpointsRef = useRef<boolean>(false);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", darkMode);
@@ -107,7 +108,10 @@ export default function App() {
     if (state.updatedAt && state.updatedAt === lastStateSyncRef.current) return;
     if (state.updatedAt) lastStateSyncRef.current = state.updatedAt;
     if (state.experts) setExperts({ ...DEFAULT_EXPERTS, ...state.experts });
-    if (state.endpoints) setEndpoints({ ...DEFAULT_ENDPOINTS, ...state.endpoints });
+    if (state.endpoints) {
+      hasPersistedEndpointsRef.current = true;
+      setEndpoints({ ...DEFAULT_ENDPOINTS, ...state.endpoints });
+    }
     if (state.swapStrategy) setSwapStrategy(state.swapStrategy);
     if (state.executionMode) setExecutionMode(state.executionMode);
     if (Array.isArray(state.chatMessages)) setChatMessages(state.chatMessages);
@@ -161,7 +165,11 @@ export default function App() {
       });
       const res = await apiFetch(`/api/system/info?${params.toString()}`);
       if (res.ok) {
-        setSystemInfo((await res.json()) as SystemInfoResponse);
+        const info = (await res.json()) as SystemInfoResponse;
+        setSystemInfo(info);
+        if (!hasPersistedEndpointsRef.current && info.defaultEndpoints) {
+          setEndpoints(info.defaultEndpoints);
+        }
       }
     } catch {
       // ignore transient network failures

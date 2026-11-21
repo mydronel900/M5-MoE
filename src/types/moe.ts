@@ -72,6 +72,8 @@ export interface SystemInfoResponse {
   freeMemoryGb: number;
   lanAddresses: LanAddress[];
   runners: RunnerStatus[];
+  defaultEndpoints?: RunnerEndpoints;
+  defaultOutputDir?: string;
   workerHealth?: WorkerHealthInfo | null;
   geminiPreviewAvailable: boolean;
 }

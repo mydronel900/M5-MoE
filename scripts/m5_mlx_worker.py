@@ -14,11 +14,11 @@ Designed for 16GB Unified Memory:
   - VAE slicing/tiling minimizes peak memory spikes during 1024px+ & video decoding
   - Live Hugging Face snapshot download byte progress streaming
 
-Install dependencies on your M5 MacBook Air:
-  pip install fastapi uvicorn pillow pydantic huggingface_hub mlx-lm mlx-vlm mflux diffusers transformers accelerate torch
+Install dependencies on your M5 MacBook Air (inside a Python venv):
+  pip install fastapi uvicorn pillow pydantic huggingface_hub mlx-lm mlx-vlm mflux diffusers transformers accelerate torch imageio[ffmpeg]
 
 Run:
-  python3 m5_mlx_worker.py
+  python3 scripts/m5_mlx_worker.py
 """
 
 import base64
@@ -30,7 +30,36 @@ import queue
 import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
+from urllib.parse import urlparse
+
+# Ensure unsupported Apple Silicon MPS ops fall back cleanly to CPU
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+
+def _load_local_dotenv() -> None:
+    """Load key=value pairs from .env if present (without overriding existing env)."""
+    candidates = [Path.cwd() / ".env", Path(__file__).resolve().parent.parent / ".env"]
+    for env_path in candidates:
+        if not env_path.is_file():
+            continue
+        try:
+            for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+            break
+        except OSError:
+            pass
+
+
+_load_local_dotenv()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,7 +67,24 @@ from fastapi.responses import StreamingResponse
 from PIL import Image
 from pydantic import BaseModel
 
-app = FastAPI(title="M5 Local MoE Worker", version="2.0.0")
+def _resolve_worker_port() -> int:
+    if os.environ.get("M5_MLX_WORKER_PORT"):
+        try:
+            return int(os.environ["M5_MLX_WORKER_PORT"])
+        except ValueError:
+            pass
+    worker_url = os.environ.get("M5_MLX_WORKER_URL", "")
+    if worker_url:
+        parsed = urlparse(worker_url)
+        if parsed.port:
+            return parsed.port
+    return 8787
+
+
+WORKER_HOST: str = os.environ.get("M5_MLX_WORKER_HOST", "127.0.0.1")
+WORKER_PORT: int = _resolve_worker_port()
+
+app = FastAPI(title="M5 Local MoE Worker", version="2.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -222,8 +268,8 @@ class ImageToImagePayload(BaseModel):
     prompt: str
     negativePrompt: Optional[str] = ""
     imageDataUrl: str
-    strength: float = 0.65
-    steps: int = 20
+    strength: float = 0.55
+    steps: int = 12
     guidanceScale: float = 7.0
     seed: Optional[int] = None
 
@@ -586,19 +632,34 @@ def run_chat_stream(payload: ChatPayload):
     return StreamingResponse(generate_events(), media_type="text/event-stream")
 
 
+def _is_mflux_model(model_id: str) -> bool:
+    return "mflux" in model_id.lower()
+
+
 def _load_t2i_pipeline(model_id: str) -> Any:
     global _ACTIVE_SLOT, _ACTIVE_MODEL_ID, _ACTIVE_PIPELINE
-    import torch
-    from diffusers import AutoPipelineForText2Image
 
     with _STATE_LOCK:
         if _ACTIVE_SLOT != "t2i" or _ACTIVE_MODEL_ID != model_id:
             clear_apple_silicon_memory()
-            pipe = AutoPipelineForText2Image.from_pretrained(
-                model_id,
-                torch_dtype=torch.float16,
-            ).to("mps")
-            _enable_memory_savers(pipe)
+            if _is_mflux_model(model_id):
+                from huggingface_hub import snapshot_download
+                from mflux import Flux1
+
+                local_path = model_id if os.path.exists(model_id) else snapshot_download(repo_id=model_id)
+                base_arch = "dev" if "dev" in model_id.lower() else "schnell"
+                quant_bits = 8 if "8bit" in model_id.lower() else 4
+                pipe = ("mflux", Flux1(model_name=base_arch, local_path=local_path, quantize=quant_bits))
+            else:
+                import torch
+                from diffusers import AutoPipelineForText2Image
+
+                diff_pipe = AutoPipelineForText2Image.from_pretrained(
+                    model_id,
+                    torch_dtype=torch.float16,
+                ).to("mps")
+                _enable_memory_savers(diff_pipe)
+                pipe = ("diffusers", diff_pipe)
             _ACTIVE_PIPELINE = pipe
             _ACTIVE_SLOT = "t2i"
             _ACTIVE_MODEL_ID = model_id
@@ -650,25 +711,38 @@ def run_t2i(payload: TextToImagePayload):
     _BUSY_COUNT += 1
     _touch_activity()
     try:
-        import torch
-        pipe = _load_t2i_pipeline(payload.model)
-        generator = torch.Generator(device="mps").manual_seed(payload.seed) if payload.seed is not None else None
-        result = pipe(
-            prompt=payload.prompt,
-            negative_prompt=payload.negativePrompt or None,
-            width=payload.width,
-            height=payload.height,
-            num_inference_steps=payload.steps,
-            guidance_scale=payload.guidanceScale,
-            generator=generator,
-        )
-        image = result.images[0]
+        kind, pipe = _load_t2i_pipeline(payload.model)
+        if kind == "mflux":
+            from mflux import Config
+
+            cfg = Config(
+                num_inference_steps=payload.steps,
+                height=payload.height,
+                width=payload.width,
+                guidance=payload.guidanceScale,
+            )
+            seed_val = payload.seed if payload.seed is not None else int(time.time()) % 2_147_483_647
+            generated = pipe.generate_image(seed=seed_val, prompt=payload.prompt, config=cfg)
+            image = generated.image if hasattr(generated, "image") else generated
+        else:
+            import torch
+            generator = torch.Generator(device="mps").manual_seed(payload.seed) if payload.seed is not None else None
+            result = pipe(
+                prompt=payload.prompt,
+                negative_prompt=payload.negativePrompt or None,
+                width=payload.width,
+                height=payload.height,
+                num_inference_steps=payload.steps,
+                guidance_scale=payload.guidanceScale,
+                generator=generator,
+            )
+            image = result.images[0]
         return {
             "imageDataUrl": encode_pil_png(image),
             "elapsedMs": int((time.time() - t0) * 1000),
         }
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"T2I MPS failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"T2I MLX/MPS failed: {exc}")
     finally:
         _BUSY_COUNT = max(0, _BUSY_COUNT - 1)
         _touch_activity()
@@ -685,45 +759,60 @@ def run_t2i_stream(payload: TextToImagePayload):
 
         def worker():
             try:
-                import torch
-                q.put({"type": "step", "step": 0, "total": payload.steps, "stage": "Loading T2I weights with VAE tiling..."})
-                pipe = _load_t2i_pipeline(payload.model)
-                generator = torch.Generator(device="mps").manual_seed(payload.seed) if payload.seed is not None else None
+                q.put({"type": "step", "step": 0, "total": payload.steps, "stage": "Loading T2I weights on Apple Silicon..."})
+                kind, pipe = _load_t2i_pipeline(payload.model)
+                if kind == "mflux":
+                    from mflux import Config
 
-                def on_step_end(p, step_index, _timestep, callback_kwargs):
-                    latents = callback_kwargs.get("latents")
-                    preview = _decode_latent_preview(p, latents)
-                    q.put({
-                        "type": "step",
-                        "step": step_index + 1,
-                        "total": payload.steps,
-                        "previewDataUrl": preview,
-                        "stage": f"Denoising step {step_index + 1}/{payload.steps}",
-                    })
-                    return callback_kwargs
+                    q.put({"type": "step", "step": 1, "total": payload.steps, "stage": "Synthesizing via 4-bit MLX Flux..."})
+                    cfg = Config(
+                        num_inference_steps=payload.steps,
+                        height=payload.height,
+                        width=payload.width,
+                        guidance=payload.guidanceScale,
+                    )
+                    seed_val = payload.seed if payload.seed is not None else int(time.time()) % 2_147_483_647
+                    generated = pipe.generate_image(seed=seed_val, prompt=payload.prompt, config=cfg)
+                    image = generated.image if hasattr(generated, "image") else generated
+                else:
+                    import torch
+                    generator = torch.Generator(device="mps").manual_seed(payload.seed) if payload.seed is not None else None
 
-                kwargs: Dict[str, Any] = {
-                    "prompt": payload.prompt,
-                    "negative_prompt": payload.negativePrompt or None,
-                    "width": payload.width,
-                    "height": payload.height,
-                    "num_inference_steps": payload.steps,
-                    "guidance_scale": payload.guidanceScale,
-                    "generator": generator,
-                }
-                try:
-                    result = pipe(**kwargs, callback_on_step_end=on_step_end)
-                except TypeError:
-                    result = pipe(**kwargs)
+                    def on_step_end(p, step_index, _timestep, callback_kwargs):
+                        latents = callback_kwargs.get("latents")
+                        preview = _decode_latent_preview(p, latents)
+                        q.put({
+                            "type": "step",
+                            "step": step_index + 1,
+                            "total": payload.steps,
+                            "previewDataUrl": preview,
+                            "stage": f"Denoising step {step_index + 1}/{payload.steps}",
+                        })
+                        return callback_kwargs
 
-                image = result.images[0]
+                    kwargs: Dict[str, Any] = {
+                        "prompt": payload.prompt,
+                        "negative_prompt": payload.negativePrompt or None,
+                        "width": payload.width,
+                        "height": payload.height,
+                        "num_inference_steps": payload.steps,
+                        "guidance_scale": payload.guidanceScale,
+                        "generator": generator,
+                    }
+                    try:
+                        result = pipe(**kwargs, callback_on_step_end=on_step_end)
+                    except TypeError:
+                        result = pipe(**kwargs)
+
+                    image = result.images[0]
+
                 q.put({
                     "type": "done",
                     "imageDataUrl": encode_pil_png(image),
                     "elapsedMs": int((time.time() - t0) * 1000),
                 })
             except Exception as exc:
-                q.put({"type": "error", "error": f"T2I MPS failed: {exc}"})
+                q.put({"type": "error", "error": f"T2I MLX/MPS failed: {exc}"})
             finally:
                 q.put(None)
 
@@ -964,4 +1053,4 @@ def run_i2v_stream(payload: ImageToVideoPayload):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8787)
+    uvicorn.run(app, host=WORKER_HOST, port=WORKER_PORT)

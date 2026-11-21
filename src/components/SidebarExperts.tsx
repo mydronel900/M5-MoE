@@ -255,7 +255,38 @@ export function SidebarExperts({
               Keep Resident
             </button>
           </div>
+
+          <div className="mt-3 flex items-center justify-between gap-2 border-t border-slate-100 pt-2.5 dark:border-slate-800">
+            <span className="text-xs text-slate-500 tabular-nums dark:text-slate-400">
+              {systemInfo?.workerHealth
+                ? systemInfo.workerHealth.activeModel
+                  ? `Active: ${systemInfo.workerHealth.activeMemoryGb ?? "?"} GB`
+                  : `Idle unload: ${Math.round(systemInfo.workerHealth.idleTimeoutSeconds / 60)}m`
+                : "Idle unload: 5m"}
+            </span>
+            <button
+              type="button"
+              onClick={onUnloadWorker}
+              disabled={isUnloadingWorker || !systemInfo?.workerHealth?.online}
+              className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
+            >
+              {isUnloadingWorker ? "Clearing..." : "Unload RAM"}
+            </button>
+          </div>
         </section>
+
+        {/* One-Click Chained MoE Pipeline */}
+        <button
+          type="button"
+          onClick={() => {
+            onOpenChainModal();
+            onCloseMobile();
+          }}
+          className="flex w-full items-center justify-center gap-2 rounded-xl bg-slate-900 px-3.5 py-2.5 text-xs font-semibold text-white transition-colors hover:bg-slate-800 dark:bg-blue-600 dark:hover:bg-blue-500"
+        >
+          <Workflow className="h-4 w-4" />
+          <span>Run Chained MoE Pipeline</span>
+        </button>
 
         {/* Execution Mode & Privacy Boundary */}
         <section
